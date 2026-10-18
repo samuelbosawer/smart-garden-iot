@@ -2,32 +2,71 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <DHT.h> // TAMBAHAN DHT
+#include <DHT.h>
 
-// --- WIFI KAKA GANTI DISINI ---
 const char* ssid = "Gas";
 const char* password = "SamBos777";
 const char* serverName = "https://iotbinus.projectbos.web.id/api/sensor";
 const char* apiKey = "binus-iot-2025";
+const char* sensorURL = "https://smart-irrigation-dashboard-phi.vercel.app/api/sensor-data";
+const char* irrigationURL = "https://smart-irrigation-dashboard-phi.vercel.app/api/irrigation-data";
 
-// --- PIN SESUAI KAKA ---
 #define SDA_PIN 32
 #define SCL_PIN 27
 #define OLED_ADDR 0x3C
-#define DHTPIN 4      // D4 TAMBAHAN
-#define DHTTYPE DHT11 // GANTI JADI DHT22 JIKA PAKAI DHT22
+#define DHTPIN 4
+#define DHTTYPE DHT11
 const int soilPin = 34;
-const int waterPin = 33;
+const int waterPin = 15;
 const int pumpPin = 23;
-const int lampu1 = 25; // D25
-const int lampu2 = 14; // D14
-const int buzzerPin = 13; // D13
+const int lampu1 = 25;
+const int lampu2 = 14;
+const int buzzerPin = 13;
+
+const int SOIL_DRY = 2900;
+const int SOIL_WET = 1300;
+#define FLOAT_AIR_HABIS LOW
+
+// --- FIX UTAMA DI SINI ---
+#define RELAY_ACTIVE_LOW true // true untuk relay biru, kalau masih kebalik ganti jadi false
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 DHT dht(DHTPIN, DHTTYPE);
 unsigned long lastSend = 0;
+
+// Fungsi anti kebalik
+void setPump(bool nyala) {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(pumpPin, nyala ? LOW : HIGH);
+  } else {
+    digitalWrite(pumpPin, nyala ? HIGH : LOW);
+  }
+}
+
+bool sendJSON(const char* url, JsonDocument& doc, const char* apiKeyHeader = NULL) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, url)) return false;
+  http.addHeader("Content-Type", "application/json");
+  if (apiKeyHeader) http.addHeader("x-api-key", apiKeyHeader);
+  String json;
+  serializeJson(doc, json);
+  int httpCode = http.POST(json);
+  Serial.printf("[API] %d %s\n", httpCode, url);
+  http.end();
+  return httpCode >= 200 && httpCode < 300;
+}
+
+int bacaSoil() {
+  long total = 0;
+  for (int i = 0; i < 10; i++) { total += analogRead(soilPin); delay(20); }
+  return total / 10;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -35,110 +74,87 @@ void setup() {
   pinMode(lampu1, OUTPUT);
   pinMode(lampu2, OUTPUT);
   pinMode(buzzerPin, OUTPUT);
-  digitalWrite(pumpPin, LOW);
+  pinMode(waterPin, INPUT_PULLUP);
+  setPump(false); // PASTIKAN MATI DARI AWAL
   digitalWrite(lampu1, LOW);
   digitalWrite(lampu2, LOW);
-
   Wire.begin(SDA_PIN, SCL_PIN);
   display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
-  dht.begin(); // INIT DHT
-  
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(1);
-  display.setCursor(0,0);
-  display.println("Connect WiFi...");
-  display.println("Init DHT D4...");
-  display.display();
-
+  dht.begin();
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500); Serial.print(".");
-  }
-  Serial.println("\nWiFi OK");
-  display.println("WiFi OK!");
-  display.println(WiFi.localIP());
-  display.display();
-  delay(2000);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nWiFi OK - FIX RELAY ACTIVE LOW");
 }
 
 void loop() {
-  int rawSoil = analogRead(soilPin);
-  int rawWater = analogRead(waterPin);
-  int persenSoil = map(rawSoil, 2900, 1300, 0, 100);
+  int rawSoil = bacaSoil();
+  int persenSoil = map(rawSoil, SOIL_DRY, SOIL_WET, 0, 100);
   persenSoil = constrain(persenSoil, 0, 100);
 
-  // BACA DHT
-  float humidity = dht.readHumidity();
-  float temperature = dht.readTemperature(); // Celcius
-  if (isnan(humidity) || isnan(temperature)) {
-    Serial.println("Gagal baca DHT!");
-    humidity = 0;
-    temperature = 0;
-  }
-
-  bool airHabis = rawWater < 300;
+  int floatStatus = digitalRead(waterPin);
+  bool airHabis = (floatStatus == FLOAT_AIR_HABIS);
+  bool airAda = !airHabis;
   bool tanahKering = persenSoil < 30;
 
-  // LOGIC POMPA LAMPU BUZZER
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+  bool dhtValid = !isnan(humidity) && !isnan(temperature);
+
+  String statusSistem;
+  bool pompaHarusNyala = false;
+
+  // --- LOGIKA KUNCI - HANYA 1 SYARAT NYALA ---
   if (airHabis) {
-    digitalWrite(pumpPin, LOW);
-    digitalWrite(lampu1, LOW);
-    digitalWrite(lampu2, HIGH);
-    tone(buzzerPin, 2500, 400);
-  } else if (tanahKering) {
-    digitalWrite(pumpPin, HIGH);
-    digitalWrite(lampu1, HIGH);
-    digitalWrite(lampu2, LOW);
-    tone(buzzerPin, 1200, 150);
+    statusSistem = "AIR HABIS!";
+    pompaHarusNyala = false;
+  } else if (airAda && tanahKering) {
+    statusSistem = "SIRAM ON";
+    pompaHarusNyala = true;
   } else {
-    digitalWrite(pumpPin, LOW);
-    digitalWrite(lampu1, LOW);
-    digitalWrite(lampu2, LOW);
-    noTone(buzzerPin);
+    statusSistem = "AMAN - BASAH";
+    pompaHarusNyala = false;
   }
 
-  // TAMPIL OLED - LAYOUT BARU DENGAN DHT
+  // Eksekusi
+  setPump(pompaHarusNyala);
+
+  if (airHabis) {
+    digitalWrite(lampu1, LOW); digitalWrite(lampu2, HIGH); tone(buzzerPin, 2500, 400);
+  } else if (pompaHarusNyala) {
+    digitalWrite(lampu1, HIGH); digitalWrite(lampu2, LOW); tone(buzzerPin, 1200, 150);
+  } else {
+    digitalWrite(lampu1, LOW); digitalWrite(lampu2, LOW); noTone(buzzerPin);
+  }
+
   display.clearDisplay();
   display.setCursor(0,0);
-  display.printf("Soil:%d%% W:%d\n", persenSoil, rawWater);
-  display.printf("T:%.1fC H:%.0f%%\n", temperature, humidity);
-  display.printf("D25:%s D14:%s\n", digitalRead(lampu1)?"ON":"OFF", digitalRead(lampu2)?"ON":"OFF");
-  if(airHabis) display.println("ALERT AIR HABIS");
-  else if(tanahKering) display.println("SIRAM ON");
-  else display.println("AMAN");
+  display.printf("Soil:%d%% %d\n", persenSoil, rawSoil);
+  display.printf("T:%.1fC H:%.0f%%\n", dhtValid?temperature:0, dhtValid?humidity:0);
+  display.printf("%s\n", airHabis ? "AIR:HABIS!" : "AIR:OK");
+  display.println(statusSistem);
   display.display();
 
-  // KIRIM KE LARAVEL SETIAP 10 DETIK
+  Serial.printf("Soil %d%% | Air %s | Pompa %s | %s\n", persenSoil, airHabis?"HABIS":"OK", pompaHarusNyala?"ON":"OFF", statusSistem.c_str());
+
   if (millis() - lastSend > 10000) {
-    if (WiFi.status() == WL_CONNECTED) {
-      HTTPClient http;
-      http.begin(serverName);
-      http.addHeader("Content-Type", "application/json");
-      http.addHeader("x-api-key", apiKey);
-
-      DynamicJsonDocument doc(768);
-      doc["soil_percent"] = persenSoil;
-      doc["soil_raw"] = rawSoil;
-      doc["water_raw"] = rawWater;
-      doc["is_water_empty"] = airHabis;
-      doc["is_soil_dry"] = tanahKering;
-      doc["pump_status"] = digitalRead(pumpPin);
-      doc["lampu1_d25"] = digitalRead(lampu1);
-      doc["lampu2_d14"] = digitalRead(lampu2);
-      doc["temperature"] = temperature; // TAMBAHAN API
-      doc["humidity"] = humidity;       // TAMBAHAN API
-
-      String json;
-      serializeJson(doc, json);
-
-      int httpCode = http.POST(json);
-      Serial.printf("Kirim: %s -> %d\n", json.c_str(), httpCode);
-      Serial.println(http.getString());
-      http.end();
-    }
     lastSend = millis();
-  }
+    DynamicJsonDocument doc(768);
+    doc["soil_percent"] = persenSoil;
+    doc["soil_raw"] = rawSoil;
+    doc["water_raw"] = floatStatus;
+    doc["water_level_status"] = airHabis ? "EMPTY" : "OK";
+    doc["is_water_empty"] = airHabis;
+    doc["is_soil_dry"] = tanahKering;
+    doc["pump_status"] = pompaHarusNyala ? 1 : 0;
+    sendJSON(serverName, doc, apiKey);
 
-  delay(2000); // DHT butuh delay 2 detik biar stabil
+    DynamicJsonDocument irrigationDoc(512);
+    irrigationDoc["soil_percent"] = persenSoil;
+    irrigationDoc["water_level_status"] = airHabis ? "EMPTY" : "OK";
+    irrigationDoc["is_water_empty"] = airHabis;
+    irrigationDoc["relay_d23"] = pompaHarusNyala;
+    irrigationDoc["pump_status"] = pompaHarusNyala ? "ON" : "OFF";
+    sendJSON(irrigationURL, irrigationDoc);
+  }
+  delay(2000);
 }
