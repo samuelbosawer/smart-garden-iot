@@ -7,158 +7,127 @@
 #include <ArduinoJson.h>
 #include <DHT.h>
 
+
+
 const char* ssid = "Gas";
 const char* password = "SamBos777";
 const char* serverName = "https://iotbinus.projectbos.web.id/api/sensor";
 const char* apiKey = "binus-iot-2025";
 const char* sensorURL = "https://smart-irrigation-dashboard-phi.vercel.app/api/sensor-data";
 const char* irrigationURL = "https://smart-irrigation-dashboard-phi.vercel.app/api/irrigation-data";
+const char* andrewSensorURL = "https://smart-garden-andrew.vercel.app/api/sensor";
+const char* andrewPumpStatusURL = "https://smart-garden-andrew.vercel.app/api/pump/status";
 
 #define SDA_PIN 32
 #define SCL_PIN 27
-#define OLED_ADDR 0x3C
 #define DHTPIN 4
 #define DHTTYPE DHT11
-const int soilPin = 34;
-const int waterPin = 15;
-const int pumpPin = 23;
-const int lampu1 = 25;
-const int lampu2 = 14;
-const int buzzerPin = 13;
+const int soilPin = 34, waterPin = 15, pumpPin = 23, lampu1 = 25, lampu2 = 14;
 
-const int SOIL_DRY = 2900;
-const int SOIL_WET = 1300;
-#define FLOAT_AIR_HABIS LOW
-#define RELAY_ACTIVE_LOW true
+const int SOIL_DRY = 3050, SOIL_WET = 1450, BATAS_KERING = 35;
+const long DURASI_SIRAM = 8000, JEDA_SIRAM = 7200000;
+#define FLOAT_HABIS LOW
+#define RELAY_LOW true
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 DHT dht(DHTPIN, DHTTYPE);
-unsigned long lastSend = 0;
+unsigned long lastSend=0, lastSiram=0, lastPumpCheck=0, lastWiFiCheck=0;
+bool sedangSiram=false; unsigned long mulaiSiram=0;
+String pumpCommand="auto";
 
-void setPump(bool nyala) {
-  if (RELAY_ACTIVE_LOW) digitalWrite(pumpPin, nyala ? LOW : HIGH);
-  else digitalWrite(pumpPin, nyala ? HIGH : LOW);
+void setPump(bool nyala){ digitalWrite(pumpPin, RELAY_LOW ? (nyala?LOW:HIGH) : (nyala?HIGH:LOW)); }
+void ensureWiFi(){
+  if(WiFi.status()==WL_CONNECTED) return;
+  WiFi.disconnect(true); delay(500); WiFi.begin(ssid,password); WiFi.setSleep(false);
+  int c=0; while(WiFi.status()!=WL_CONNECTED && c<20){ delay(500); c++; }
 }
-
-bool sendJSON(const char* url, JsonDocument& doc, const char* apiKeyHeader = NULL) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  if (!http.begin(client, url)) return false;
-  http.addHeader("Content-Type", "application/json");
-  if (apiKeyHeader) http.addHeader("x-api-key", apiKeyHeader);
-  String json; serializeJson(doc, json);
-  Serial.println("Kirim: " + json);
-  int httpCode = http.POST(json);
-  Serial.printf("[API] %d -> %s\n", httpCode, url);
-  Serial.println(http.getString());
+bool postData(const char* url, JsonDocument& doc, const char* key=NULL){
+  if(WiFi.status()!=WL_CONNECTED) return false;
+  WiFiClientSecure client; client.setInsecure(); client.setTimeout(5000);
+  HTTPClient http; http.setTimeout(8000);
+  if(!http.begin(client, url)) return false;
+  http.addHeader("Content-Type","application/json");
+  if(key) http.addHeader("x-api-key", key);
+  String j; serializeJson(doc,j);
+  Serial.printf("POST %s\n%s\n",url,j.c_str());
+  int code=http.POST(j); Serial.printf("-> %d %s\n",code,http.getString().c_str());
+  http.end(); delay(600); return code>=200 && code<300;
+}
+bool postAndrew(JsonDocument& doc){
+  if(WiFi.status()!=WL_CONNECTED) return false;
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http; http.begin(client, andrewSensorURL);
+  http.addHeader("Content-Type","application/json");
+  String j; serializeJson(doc,j);
+  int code=http.POST(j); String p=http.getString();
+  Serial.printf("[ANDREW %d] %s\n",code,p.c_str());
+  if(code>=200 && code<300){ JsonDocument r; if(!deserializeJson(r,p) && r["pump_command"].is<String>()) pumpCommand=r["pump_command"].as<String>(); }
+  http.end(); delay(600); return code>=200 && code<300;
+}
+void getPumpStatus(){
+  if(WiFi.status()!=WL_CONNECTED) return;
+  WiFiClientSecure c; c.setInsecure(); HTTPClient http;
+  if(!http.begin(c, andrewPumpStatusURL)) return;
+  if(http.GET()==200){ String p=http.getString(); JsonDocument r; if(!deserializeJson(r,p)){ if(r["pump_command"].is<String>()) pumpCommand=r["pump_command"].as<String>(); else if(r["command"].is<String>()) pumpCommand=r["command"].as<String>(); } }
   http.end();
-  return httpCode >= 200 && httpCode < 300;
 }
+int bacaSoil(){ long t=0; for(int i=0;i<10;i++){ t+=analogRead(soilPin); delay(10);} return t/10; }
 
-int bacaSoil() {
-  long total = 0;
-  for (int i = 0; i < 10; i++) { total += analogRead(soilPin); delay(20); }
-  return total / 10;
-}
-
-void setup() {
+void setup(){
   Serial.begin(115200);
-  pinMode(pumpPin, OUTPUT); pinMode(lampu1, OUTPUT); pinMode(lampu2, OUTPUT);
-  pinMode(buzzerPin, OUTPUT); pinMode(waterPin, INPUT_PULLUP);
-  setPump(false); digitalWrite(lampu1, LOW); digitalWrite(lampu2, LOW);
-  Wire.begin(SDA_PIN, SCL_PIN); Wire.setClock(100000);
-  display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
-  dht.begin();
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println("\nWiFi OK - FIX DHT API");
+  pinMode(pumpPin,OUTPUT); pinMode(lampu1,OUTPUT); pinMode(lampu2,OUTPUT); pinMode(waterPin,INPUT_PULLUP);
+  setPump(false); digitalWrite(lampu1,LOW); digitalWrite(lampu2,LOW);
+  Wire.begin(SDA_PIN,SCL_PIN); display.begin(SSD1306_SWITCHCAPVCC,0x3C); dht.begin();
+  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(ssid,password);
+  while(WiFi.status()!=WL_CONNECTED){ delay(500); Serial.print("."); }
+  Serial.println("\nWiFi OK - FULL DATA SAME"); lastSiram=millis()-JEDA_SIRAM;
 }
 
-void loop() {
-  int rawSoil = bacaSoil();
-  int persenSoil = map(rawSoil, SOIL_DRY, SOIL_WET, 0, 100);
-  persenSoil = constrain(persenSoil, 0, 100);
+void loop(){
+  if(millis()-lastWiFiCheck>15000){ lastWiFiCheck=millis(); ensureWiFi(); }
+  int raw=bacaSoil(); int persen=constrain(map(raw,SOIL_DRY,SOIL_WET,0,100),0,100);
+  int wRaw=digitalRead(waterPin); bool habis=(wRaw==FLOAT_HABIS);
+  float hum=dht.readHumidity(); float temp=dht.readTemperature();
+  bool valid=!isnan(hum)&&!isnan(temp);
+  if(millis()-lastPumpCheck>10000){ lastPumpCheck=millis(); getPumpStatus(); }
 
-  int floatStatus = digitalRead(waterPin);
-  bool airHabis = (floatStatus == FLOAT_AIR_HABIS);
-  bool airAda = !airHabis;
-  bool tanahKering = persenSoil < 30;
-
-  // --- FIX DHT BACA 2 KALI BIAR STABIL ---
-  float humidity = dht.readHumidity();
-  float temperature = dht.readTemperature();
-  delay(100);
-  if (isnan(humidity) || isnan(temperature)) {
-    humidity = dht.readHumidity();
-    temperature = dht.readTemperature();
+  bool pompaOn=false; unsigned long now=millis(); String stat;
+  if(pumpCommand=="pump_on"){ setPump(true); pompaOn=true; stat="MANUAL ON"; sedangSiram=false; }
+  else if(pumpCommand=="pump_off"){ setPump(false); stat="MANUAL OFF"; sedangSiram=false; }
+  else{
+    if(sedangSiram){ if(now-mulaiSiram>=DURASI_SIRAM){ setPump(false); sedangSiram=false; lastSiram=now; stat="SELESAI"; } else { setPump(true); pompaOn=true; stat="AUTO SIRAM"; } }
+    else{ if(habis){ stat="AIR HABIS"; setPump(false);} else if(persen<BATAS_KERING && now-lastSiram>=JEDA_SIRAM){ setPump(true); sedangSiram=true; mulaiSiram=now; pompaOn=true; stat="MULAI AUTO"; } else { stat= persen<BATAS_KERING ? "TUNGGU" : "LEMBAB AMAN"; setPump(false); } }
   }
-  bool dhtValid = !isnan(humidity) && !isnan(temperature);
+  digitalWrite(lampu1,pompaOn?HIGH:LOW); digitalWrite(lampu2,habis?HIGH:LOW);
 
-  String statusSistem;
-  bool pompaHarusNyala = false;
-  if (airHabis) { statusSistem = "AIR HABIS!"; pompaHarusNyala = false; }
-  else if (airAda && tanahKering) { statusSistem = "SIRAM ON"; pompaHarusNyala = true; }
-  else { statusSistem = "AMAN - BASAH"; pompaHarusNyala = false; }
+  display.clearDisplay(); display.setCursor(0,0); display.setTextColor(1);
+  display.println("3 API SAME DATA"); display.printf("Soil %d%% %s\n",persen,pumpCommand.c_str());
+  if(valid) display.printf("T%.1f H%.0f\n",temp,hum); display.printf("%s %s\n",habis?"HABIS":"OK",stat.c_str()); display.display();
 
-  setPump(pompaHarusNyala);
-  if (airHabis) { digitalWrite(lampu1, LOW); digitalWrite(lampu2, HIGH); tone(buzzerPin, 2500, 400); }
-  else if (pompaHarusNyala) { digitalWrite(lampu1, HIGH); digitalWrite(lampu2, LOW); tone(buzzerPin, 1200, 150); }
-  else { digitalWrite(lampu1, LOW); digitalWrite(lampu2, LOW); noTone(buzzerPin); }
+  if(millis()-lastSend>25000){
+    lastSend=millis(); if(WiFi.status()!=WL_CONNECTED){ ensureWiFi(); return; }
+    static int g=0; g++; int mode=g%3;
 
-  display.clearDisplay();
-  display.setCursor(0,0); display.setTextColor(SSD1306_WHITE);
-  display.printf("Soil:%d%% %d\n", persenSoil, rawSoil);
-  if (dhtValid) display.printf("T:%.1fC H:%.0f%%\n", temperature, humidity);
-  else display.println("DHT: ERROR");
-  display.printf("%s\n", airHabis ? "AIR:HABIS!" : "AIR:OK");
-  display.println(statusSistem);
-  display.display();
+    // DATA MASTER - SAMA UNTUK SEMUA API
+    JsonDocument master;
+    master["device_id"]="ESP32-BAMER-01";
+    master["tanaman"]="bawang_merah";
+    master["soil_percent"]=persen;
+    master["soil_raw"]=raw;
+    master["temperature"]= valid?temp:0;
+    master["humidity"]= valid?hum:0;
+    master["water_raw"]=wRaw;
+    master["water_level_status"]= habis?"EMPTY":"OK";
+    master["is_water_empty"]=habis;
+    master["is_soil_dry"]= persen<BATAS_KERING;
+    master["pump_status"]= pompaOn?"ON":"OFF";
+    master["relay_d23"]=pompaOn;
+    master["pump_command"]=pumpCommand;
+    master["pump_command_local"]=pumpCommand;
 
-  Serial.printf("Soil %d%% | Air %s | DHT %s | Pompa %s\n", persenSoil, airHabis?"HABIS":"OK", dhtValid?"OK":"ERR", pompaHarusNyala?"ON":"OFF");
-
-  if (millis() - lastSend > 10000) {
-    lastSend = millis();
-    
-    // --- FIX API: JANGAN KIRIM NaN ---
-    DynamicJsonDocument doc(768);
-    doc["soil_percent"] = persenSoil;
-    doc["soil_raw"] = rawSoil;
-    doc["water_raw"] = floatStatus;
-    doc["water_level_status"] = airHabis ? "EMPTY" : "OK";
-    doc["is_water_empty"] = airHabis;
-    doc["is_soil_dry"] = tanahKering;
-    doc["pump_status"] = pompaHarusNyala ? 1 : 0;
-    doc["lampu1_d25"] = digitalRead(lampu1);
-    doc["lampu2_d14"] = digitalRead(lampu2);
-    if (dhtValid) {
-      doc["temperature"] = temperature;
-      doc["humidity"] = humidity;
-    } else {
-      doc["temperature"] = 0; // kirim 0 jangan NaN biar API tidak error
-      doc["humidity"] = 0;
-      doc["dht_error"] = true;
-    }
-    sendJSON(serverName, doc, apiKey);
-
-    if (dhtValid) {
-      DynamicJsonDocument sensorDoc(256);
-      sensorDoc["device_id"] = "ESP32-01";
-      sensorDoc["temperature"] = temperature;
-      sensorDoc["humidity"] = humidity;
-      sendJSON(sensorURL, sensorDoc);
-    } else {
-      Serial.println("[API sensor-data] SKIP karena DHT ERROR");
-    }
-
-    DynamicJsonDocument irrigationDoc(512);
-    irrigationDoc["soil_percent"] = persenSoil;
-    irrigationDoc["water_level_status"] = airHabis ? "EMPTY" : "OK";
-    irrigationDoc["is_water_empty"] = airHabis;
-    irrigationDoc["relay_d23"] = pompaHarusNyala;
-    irrigationDoc["pump_status"] = pompaHarusNyala ? "ON" : "OFF";
-    sendJSON(irrigationURL, irrigationDoc);
+    if(mode==0){ Serial.println("== KIRIM BINUS =="); postData(serverName, master, apiKey); }
+    else if(mode==1){ Serial.println("== KIRIM DASHBOARD LAMA =="); postData(sensorURL, master); delay(1000); postData(irrigationURL, master); }
+    else { Serial.println("== KIRIM ANDREW =="); postAndrew(master); }
   }
-  delay(2000);
+  delay(500);
 }
